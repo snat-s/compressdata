@@ -1,0 +1,50 @@
+data/
+docs/
+src/tmp/
+src/wandb/
+src/decompresssed
+src/enwik4
+src/enwik4.compressed
+
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# C extensions
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environment
+venv/
+env/
+
+# IDE-specific files
+.idea/
+.vscode/
+
+# Compiled Python files
+*.pyc
+*.pyo
+*.pyd
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Miscellaneous
+*.bak
+*.swp
+*.tmp
+*.pyc
+
