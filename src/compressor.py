@@ -1,6 +1,6 @@
 """
    The structure is mainly based from the works of Yu Mao, et. al.
-   https://github.com/mynotwo/A-Fast-Transformer-based-General-Purpose-LosslessCompressor 
+   https://github.com/mynotwo/A-Fast-Transformer-based-General-Purpose-LosslessCompressor
 """
 import numpy as np
 import os
@@ -16,19 +16,22 @@ from model import GPT, GPTConfig
 from tqdm import trange
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 512
+BATCH_SIZE = 1024
 SHOULD_SAVE = True
 SEQ_LENGTH = 8
 ENCODE = True
-DECODE = True 
+DECODE = True
 VOCAB_SIZE = 256
 LOG_TRAINING = 1000
 SEED = 42
+TMP_DIR = "tmp"
+FILE_PATH = "data/enwik4"
+COMPRESSED_FILE = "enwik4_1"
 
 # MODEL CONFIG
 VOCAB_DIM = 64
 HIDDEN_DIM = 256
-N_LAYERS = 4
+N_LAYERS = 1
 FFN_DIM = 4096
 N_HEADS = 8
 FEATURE_TYPE = 'sqr'
@@ -69,6 +72,7 @@ def var_int_encode(byte_str_len, f):
 def var_int_decode(f):
     byte_str_len = 0
     shift = 1
+    #print(byte_str_len, f.read(1))
     while True:
         this_byte = struct.unpack('B', f.read(1))[0]
         byte_str_len += (this_byte & 127) * shift
@@ -85,14 +89,111 @@ def decode_token(token): return str(chr(max(32, token)))
 def decode_tokens(tokens): return ''.join(list(map(decode_token, tokens)))
 
 
+def decode(temp_dir, compressed_file, len_series, last):
+
+    iter_num = (len_series - SEQ_LENGTH) // BATCH_SIZE
+    ind = np.array(range(BATCH_SIZE))*iter_num
+    print(iter_num - SEQ_LENGTH)
+    series_2d = np.zeros((BATCH_SIZE, iter_num), dtype=np.uint8).astype('int')
+
+    f = [open(temp_dir+"/"+compressed_file+'.'+str(i), 'rb')
+         for i in range(BATCH_SIZE)]
+    bitin = [arithmeticcoding.BitInputStream(f[i]) for i in range(BATCH_SIZE)]
+    dec = [arithmeticcoding.ArithmeticDecoder(
+        32, bitin[i]) for i in range(BATCH_SIZE)]
+
+    prob = np.ones(VOCAB_SIZE)/VOCAB_SIZE
+    cumul = np.zeros(VOCAB_SIZE+1, dtype=np.uint64)
+    cumul[1:] = np.cumsum(prob*10000000 + 1)
+
+    # Decode first K symbols in each stream with uniform probabilities
+    for i in range(BATCH_SIZE):
+        for j in range(min(SEQ_LENGTH, iter_num)):
+            series_2d[i, j] = dec[i].read(cumul, VOCAB_SIZE)
+
+    cumul_batch = np.zeros((BATCH_SIZE, VOCAB_SIZE+1), dtype=np.uint64)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    model = GPT(GPTConfig(block_size=SEQ_LENGTH, vocab_size=VOCAB_SIZE,
+                          n_layer=N_LAYERS, n_head=N_HEADS,
+                          n_embd=VOCAB_DIM, dropout=0.0, bias=True))
+    model = model.to(device)
+    #model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
+    #                     N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
+    #                     COMPUTE_TYPE).cuda()
+    print(model)
+
+    optimizer = torch.optim.Adam(model.parameters(
+    ), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=(.9, .999))
+
+    # training_start = time.time()
+    for train_index in trange(iter_num-SEQ_LENGTH):
+        model.train()
+        train_batch = torch.LongTensor(
+            series_2d[:, train_index:train_index + SEQ_LENGTH]).cuda()
+        logits, _ = model.forward(train_batch)
+        #logits = model.forward(train_batch)
+        prob = logits[:, -1, :]
+        prob = F.softmax(prob, dim=1).detach().cpu().numpy()
+
+        cumul_batch[:, 1:] = np.cumsum(prob*10000000 + 1, axis=1)
+
+        # Decode with Arithmetic Encoder
+        for i in range(BATCH_SIZE):
+            series_2d[i, train_index +
+                      SEQ_LENGTH] = dec[i].read(cumul_batch[i, :], VOCAB_SIZE)
+
+        logits = logits.transpose(1, 2)
+        label = torch.from_numpy(
+            series_2d[:, train_index+1:train_index+SEQ_LENGTH+1]).cuda()
+        train_loss = torch.nn.functional.cross_entropy(
+            logits[:, :, -1], label[:, -1], reduction='mean')
+        train_loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        if train_index % LOG_TRAINING == 0:
+            print(train_index, ":", train_loss.item()/np.log(2))
+
+    out = open('decompressed_file', 'w')
+    for i in range(len(series_2d)):
+        out.write(decode_tokens(series_2d[i]))
+
+    for i in range(BATCH_SIZE):
+        bitin[i].close()
+        f[i].close()
+
+    if last:
+        series = np.zeros(last, dtype=np.uint8).astype('int')
+        f = open(temp_dir+"/"+compressed_file+'.last', 'rb')
+        bitin = arithmeticcoding.BitInputStream(f)
+        dec = arithmeticcoding.ArithmeticDecoder(32, bitin)
+        prob = np.ones(VOCAB_SIZE)/VOCAB_SIZE
+        cumul = np.zeros(VOCAB_SIZE+1, dtype=np.uint64)
+        cumul[1:] = np.cumsum(prob*10000000 + 1)
+
+        for j in range(last):
+            series[j] = dec.read(cumul, VOCAB_SIZE)
+
+        print("Last decode part don't need inference.")
+        out.write(decode_tokens(series))
+        print(decode_tokens(series))
+        bitin.close()
+        f.close()
+        return
+
+
 def encode(temp_dir, compressed_file, series, train_data, last_train_data):
-    bs = BATCH_SIZE
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
 
     f = [open(os.path.join(temp_dir, compressed_file+'.'+str(i)), 'wb')
-         for i in range(bs)]
-    bitout = [arithmeticcoding.BitOutputStream(f[i]) for i in range(bs)]
+         for i in range(BATCH_SIZE)]
+    bitout = [arithmeticcoding.BitOutputStream(
+        f[i]) for i in range(BATCH_SIZE)]
     enc = [arithmeticcoding.ArithmeticEncoder(
-        32, bitout[i]) for i in range(bs)]
+        32, bitout[i]) for i in range(BATCH_SIZE)]
 
     # Start the probabilities at the same spot
     prob = np.ones(VOCAB_SIZE)/VOCAB_SIZE
@@ -100,21 +201,21 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
     cumul[1:] = np.cumsum(prob*10000000 + 1)
 
     iter_num = len(train_data)//BATCH_SIZE
-    ind = np.array(range(bs))*iter_num
+    ind = np.array(range(BATCH_SIZE))*iter_num
     iter_num -= SEQ_LENGTH
 
-    for i in range(bs):
+    for i in range(BATCH_SIZE):
         for j in range(SEQ_LENGTH):
             enc[i].write(cumul, series[ind[i]+j])
 
-    cumul_batch = np.zeros((bs, VOCAB_SIZE+1), dtype=np.uint64)
-    # model = GPT(GPTConfig(block_size=SEQ_LENGTH, vocab_size=VOCAB_SIZE,
-    #            n_layer=N_LAYERS, n_head=N_HEADS,
-    #            n_embd=VOCAB_DIM, dropout=0.0, bias=True))
+    cumul_batch = np.zeros((BATCH_SIZE, VOCAB_SIZE+1), dtype=np.uint64)
+    model = GPT(GPTConfig(block_size=SEQ_LENGTH, vocab_size=VOCAB_SIZE,
+                          n_layer=N_LAYERS, n_head=N_HEADS,
+                          n_embd=VOCAB_DIM, dropout=0.0, bias=True))
 
-    model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
-                          N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
-                          COMPUTE_TYPE)
+    #model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
+    #                      N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
+    #                      COMPUTE_TYPE)
 
     total_params = sum(p.numel() for p in model.parameters())
     model = model.to(device)
@@ -145,7 +246,7 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
         prob = F.softmax(prob, dim=1).detach().cpu().numpy()
         cumul_batch[:, 1:] = np.cumsum(prob*10000000 + 1, axis=1)
 
-        for i in range(bs):
+        for i in range(BATCH_SIZE):
             enc[i].write(cumul_batch[i, :], y[i])
 
         ind += 1
@@ -156,7 +257,7 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
             print(train_index, ":", train_loss.item() /
                   np.log(2), "size:", size/(1024*1024))
 
-    for i in range(bs):
+    for i in range(BATCH_SIZE):
         enc[i].finish()
         bitout[i].close()
         f[i].close()
@@ -164,7 +265,7 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
     if last_train_data is not None:
 
         print("last series")
-        f = open(temp_dir+"/"+compressed_file+'.last', 'wb')
+        f = open(os.path.join(temp_dir, compressed_file)+'.last', 'wb')
         bitout = arithmeticcoding.BitOutputStream(f)
         enc = arithmeticcoding.ArithmeticEncoder(32, bitout)
 
@@ -181,116 +282,15 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
         bitout.close()
         f.close()
 
-    wandb.finish()
-
-
-def decode(temp_dir, compressed_file, len_series, last_line):
-    iter_num = (len_series-SEQ_LENGTH) // BATCH_SIZE
-    ind = np.array(range(BATCH_SIZE))*iter_num
-    series_2d = np.zeros((BATCH_SIZE, iter_num), dtype=np.uint8).astype('int')
-
-    f = [open(os.path.join(temp_dir, compressed_file)+'.'+str(i), 'rb')
-         for i in range(BATCH_SIZE)]
-    bitin = [arithmeticcoding.BitInputStream(f[i]) for i in range(BATCH_SIZE)]
-    dec = [arithmeticcoding.ArithmeticDecoder(
-        32, bitin[i]) for i in range(BATCH_SIZE)]
-
-    prob = np.ones(VOCAB_SIZE) / VOCAB_SIZE
-    cumul = np.zeros(VOCAB_SIZE + 1, dtype=np.uint64)
-    cumul[1:] = np.cumsum(prob*10000000+1)
-
-    for i in range(BATCH_SIZE):
-        for j in range(min(SEQ_LENGTH, iter_num)):
-            series_2d[i, j] = dec[i].read(cumul, VOCAB_SIZE)
-
-    cumul_batch = np.zeros((BATCH_SIZE, VOCAB_SIZE+1), dtype=np.uint64)
-
-    # model = GPT(GPTConfig(block_size=SEQ_LENGTH, vocab_size=VOCAB_SIZE,
-    #             n_layer=N_LAYERS, n_head=N_HEADS,
-    #             n_embd=VOCAB_DIM, dropout=0.0, bias=True))
-
-    model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
-                          N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
-                          COMPUTE_TYPE)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    model = model.to(device)
-
-    print(f"The model has {total_params} parameters")
-
-    if torch.__version__ > "1.0.0":
-        print("Compiling model")
-        model = torch.compile(model)
-
-    optim = torch.optim.Adam(
-        model.parameters(), LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    model.train()
-
-    for train_index in trange(iter_num-SEQ_LENGTH):
-        train_batch = torch.LongTensor(
-            series_2d[:, train_index:train_index+SEQ_LENGTH]).cuda()
-
-        logits = model.forward(train_batch)
-        # wandb.log({"loss": train_loss})
-        prob = logits[:, -1, :]
-        prob = F.softmax(prob, dim=1).detach().cpu().numpy()
-        cumul_batch[:, 1:] = np.cumsum(prob*10000000 + 1, axis=1)
-
-        for i in range(BATCH_SIZE):
-            series_2d[i, train_index +
-                      SEQ_LENGTH] = dec[i].read(cumul_batch[i, :], VOCAB_SIZE)
-
-        logits = logits.transpose(1, 2)
-        label = torch.from_numpy(
-            series_2d[:, train_index+1:train_index+SEQ_LENGTH+1]).cuda()
-
-        loss = F.cross_entropy(logits[:, :, 1], label[:, -1], reduction='mean')
-        loss.backward()
-
-        optim.step()
-        optim.zero_grad(set_to_none=True)
-
-        # ind += 1
-
-        if train_index % LOG_TRAINING == 0:
-            print(train_index, ":", loss.item() /
-                  np.log(2))
-        out = open("decompresssed", "w")
-        for i in range(len(series_2d)):
-            out.write(decode_tokens(series_2d[i]))
-
-        for i in range(BATCH_SIZE):
-            bitin[i].close()
-            f[i].close()
-
-    #     if last_line:
-    #         series = np.zeros(last_line, dtype=np.uint8).astype('int')
-    #         f = open(os.path.join(temp_dir, compressed_file)+'.last', 'rb')
-
-    #         bitin = arithmeticcoding.BitInputStream(f)
-    #         dec = arithmeticcoding.ArithmeticDecoder(32, bitin)
-
-    #         prob = np.ones(VOCAB_SIZE) / VOCAB_SIZE
-    #         cumul = np.zeros(VOCAB_SIZE + 1, dtype=np.uint64)
-    #         cumul[1:] = np.cumsum(prob*10000000+1)
-
-    #         for j in range(last):
-    #             series[j] = dec.read(cumul, VOCAB_SIZE)
-
-    #         print("Last decode doesn't need inference")
-    #         out.write(decode_tokens(series))
-
-    #         bitin.close()
-    #         f.close()
-    # #    return
+    #wandb.finish()
 
 
 def main():
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    temp_dir = "tmp"
-    file_path = "enwik4"
-    compressed_file = "enwik4"
+    temp_dir = TMP_DIR
+    file_path = FILE_PATH
+    compressed_file = COMPRESSED_FILE
 
     if not os.path.exists(temp_dir):
         os.mkdir(temp_dir)
@@ -310,6 +310,7 @@ def main():
     if ENCODE and total_length % BATCH_SIZE == 0:
         encode(temp_dir, compressed_file, series, training_data, None)
     elif ENCODE:
+        # encode(temp_dir, compressed_file, series, training_data, None)
         last_lines = total_length // BATCH_SIZE * BATCH_SIZE
         encode(temp_dir, compressed_file,
                series[:last_lines + SEQ_LENGTH], training_data[:last_lines],
@@ -350,6 +351,7 @@ def main():
             print(f"Created directory at {temp_dir}")
         f = open(compressed_file+'.compressed', 'rb')
         len_series = len(series)
+
         for i in range(BATCH_SIZE):
             f_out = open(os.path.join(
                 temp_dir, compressed_file)+'.'+str(i), 'wb')
@@ -358,6 +360,13 @@ def main():
             f_out.write(byte_str)
             f_out.close()
 
+        f_out = open(os.path.join(temp_dir, compressed_file)+'.last', 'wb')
+        byte_str_len = var_int_decode(f)
+        byte_str = f.read(byte_str_len)
+        f_out.write(byte_str)
+        f_out.close()
+        f.close()
+
         len_series = len(series)
 
         if (len_series-SEQ_LENGTH) % BATCH_SIZE == 0:
@@ -365,6 +374,8 @@ def main():
         else:
             last_lines = (len_series-SEQ_LENGTH) % BATCH_SIZE + SEQ_LENGTH
             decode(temp_dir, compressed_file, len_series, last_lines)
+
+        shutil.rmtree(temp_dir)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ class RWKV_TimeMix_x051a(nn.Module):
         self.n_head = config.n_head
 
         with torch.no_grad():
-            ratio_0_to_1 = layer_id / (config.n_layer - 1)  # 0 to 1
+            ratio_0_to_1 = layer_id / max((config.n_layer - 1), 1)  # 0 to 1
             ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
             ddd = torch.ones(1, 1, config.n_embd)
             for i in range(config.n_embd):
