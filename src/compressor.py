@@ -13,20 +13,21 @@ import wandb
 import arithmeticcoding
 from transformer_model import SLiMPerformer
 from model import GPT, GPTConfig
+from mamba_ssm import Mamba
 from tqdm import trange
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 1024
+BATCH_SIZE = 512
 SHOULD_SAVE = True
 SEQ_LENGTH = 8
 ENCODE = True
-DECODE = True
+DECODE = False
 VOCAB_SIZE = 256
 LOG_TRAINING = 1000
 SEED = 42
 TMP_DIR = "tmp"
-FILE_PATH = "data/enwik4"
-COMPRESSED_FILE = "enwik4_1"
+FILE_PATH = "data/enwik8"
+COMPRESSED_FILE = "enwik8_1"
 
 # MODEL CONFIG
 VOCAB_DIM = 64
@@ -42,44 +43,54 @@ WEIGHT_DECAY = 0.0
 
 
 # WANDB config
-# wandb.init(
-#     # set the wandb project where this run will be logged
-#     project="compressdata",
+wandb.init(
+    # set the wandb project where this run will be logged
+    project="compressdata",
 
-#     # track hyperparameters and run metadata
-#     config={
-#         "learning_rate": LEARNING_RATE,
-#         "architecture": "RWKV",
-#         "dataset": "enwik8",
-#         "epochs": 1,
-#         "n_layers": N_LAYERS,
-#     }
-# )
+    # track hyperparameters and run metadata
+    config={
+        "learning_rate": LEARNING_RATE,
+        "architecture": "RWKV",
+        "dataset": FILE_PATH,
+        "epochs": 1,
+        "n_layers": N_LAYERS,
+        "ENCODE": ENCODE,
+        "DECODE": DECODE,
+    }
+)
 # END WANDB config
 
 
 def var_int_encode(byte_str_len, f):
-    while True:
+    #print(byte_str_len, end=" ")
+
+    while byte_str_len > 0:
         this_byte = byte_str_len & 127
         byte_str_len >>= 7
+
         if byte_str_len == 0:
             f.write(struct.pack('B', this_byte))
-            break
-        f.write(struct.pack('B', this_byte | 128))
-    byte_str_len -= 1
+        else:
+            f.write(struct.pack('B', this_byte | 128))
 
 
 def var_int_decode(f):
+    data = f.read(1)
     byte_str_len = 0
     shift = 1
-    #print(byte_str_len, f.read(1))
+
     while True:
-        this_byte = struct.unpack('B', f.read(1))[0]
+        this_byte = struct.unpack('B', data)[0]
+        #print(this_byte, end=" ")
+
         byte_str_len += (this_byte & 127) * shift
+
         if this_byte & 128 == 0:
             break
+
         shift <<= 7
-        byte_str_len += shift
+        data = f.read(1)
+
     return byte_str_len
 
 
@@ -96,7 +107,7 @@ def decode(temp_dir, compressed_file, len_series, last):
     print(iter_num - SEQ_LENGTH)
     series_2d = np.zeros((BATCH_SIZE, iter_num), dtype=np.uint8).astype('int')
 
-    f = [open(temp_dir+"/"+compressed_file+'.'+str(i), 'rb')
+    f = [open(os.path.join(temp_dir, compressed_file)+'.'+str(i), 'rb')
          for i in range(BATCH_SIZE)]
     bitin = [arithmeticcoding.BitInputStream(f[i]) for i in range(BATCH_SIZE)]
     dec = [arithmeticcoding.ArithmeticDecoder(
@@ -128,8 +139,8 @@ def decode(temp_dir, compressed_file, len_series, last):
     ), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=(.9, .999))
 
     # training_start = time.time()
+    model.train()
     for train_index in trange(iter_num-SEQ_LENGTH):
-        model.train()
         train_batch = torch.LongTensor(
             series_2d[:, train_index:train_index + SEQ_LENGTH]).cuda()
         logits, _ = model.forward(train_batch)
@@ -149,6 +160,8 @@ def decode(temp_dir, compressed_file, len_series, last):
             series_2d[:, train_index+1:train_index+SEQ_LENGTH+1]).cuda()
         train_loss = torch.nn.functional.cross_entropy(
             logits[:, :, -1], label[:, -1], reduction='mean')
+
+        wandb.log({"loss": train_loss})
         train_loss.backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -166,7 +179,7 @@ def decode(temp_dir, compressed_file, len_series, last):
 
     if last:
         series = np.zeros(last, dtype=np.uint8).astype('int')
-        f = open(temp_dir+"/"+compressed_file+'.last', 'rb')
+        f = open(os.path.join(temp_dir, compressed_file)+'.last', 'rb')
         bitin = arithmeticcoding.BitInputStream(f)
         dec = arithmeticcoding.ArithmeticDecoder(32, bitin)
         prob = np.ones(VOCAB_SIZE)/VOCAB_SIZE
@@ -181,6 +194,8 @@ def decode(temp_dir, compressed_file, len_series, last):
         print(decode_tokens(series))
         bitin.close()
         f.close()
+
+        wandb.finish()
         return
 
 
@@ -230,14 +245,14 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
     optim = torch.optim.Adam(
         model.parameters(), LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     model.train()
-
+    print("Number of iterations",iter_num)
     for train_index in trange(iter_num):
         train_batch = train_data[ind, :]
         y = train_batch[:, -1]
         train_batch = torch.from_numpy(train_batch).cuda().long()
 
         train_loss, logits = model.full_loss(train_batch, with_grad=True)
-        # wandb.log({"loss": train_loss})
+        wandb.log({"loss": train_loss})
         optim.step()
         optim.zero_grad(set_to_none=True)
 
@@ -270,7 +285,7 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
         enc = arithmeticcoding.ArithmeticEncoder(32, bitout)
 
         prob = np.ones(VOCAB_SIZE)/VOCAB_SIZE
-        cumul = np.zeros(VOCAB_SIZE+1, np.uint64)
+        cumul = np.zeros(VOCAB_SIZE+1, dtype=np.uint64)
         cumul[1:] = np.cumsum(prob*10000000 + 1)
 
         for j in range(len(last_train_data)):
@@ -282,7 +297,6 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
         bitout.close()
         f.close()
 
-    #wandb.finish()
 
 
 def main():
@@ -300,6 +314,9 @@ def main():
         nrows = ((a.size - L) // S) + 1
         n = a.strides[0]
         return np.lib.stride_tricks.as_strided(a, shape=(nrows, L), strides=(S * n, n))
+
+    global SEQ_LENGTH
+    SEQ_LENGTH = SEQ_LENGTH*(HIDDEN_DIM // VOCAB_DIM)
 
     with open(file_path, "rb") as f:
         series = np.frombuffer(f.read(), dtype=np.uint8)
@@ -324,17 +341,18 @@ def main():
             f_in = open(os.path.join(
                 temp_dir, compressed_file+'.'+str(i)), 'rb')
             byte_str = f_in.read()
-            var_int_encode(len(byte_str), f)
+            byte_str_len = len(byte_str)
+            var_int_encode(byte_str_len, f)
             f.write(byte_str)
             f_in.close()
 
         if total_length % BATCH_SIZE != 0:
-            f_in = open(temp_dir+"/"+compressed_file+'.last', 'rb')
+            f_in = open(os.path.join(temp_dir, compressed_file)+'.last', 'rb')
             byte_str = f_in.read()
             var_int_encode(len(byte_str), f)
             f.write(byte_str)
             f_in.close()
-            f.close()
+        f.close()
 
         total = 0
 
