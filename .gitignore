@@ -4,6 +4,7 @@ src/wandb/
 src/decompresssed
 src/enwik4
 src/enwik4.compressed
+src/compressed
 
 
 # Byte-compiled / optimized / DLL files

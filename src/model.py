@@ -214,6 +214,7 @@ class Block(nn.Module):
     def forward(self, x):
         x = x + self.tmix(self.ln_1(x))
         x = x + self.cmix(self.ln_2(x))
+        x = x + self.cmix(self.ln_2(x))
         return x
 
 

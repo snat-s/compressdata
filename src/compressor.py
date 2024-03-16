@@ -8,61 +8,65 @@ import torch
 import torch.nn.functional as F
 import struct
 import shutil
-import wandb
+# import wandb
 
 import arithmeticcoding
 from transformer_model import SLiMPerformer
 from model import GPT, GPTConfig
-from mamba_ssm import Mamba
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.models.config_mamba import MambaConfig
 from tqdm import trange
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 512
-SHOULD_SAVE = True
+print(device)
+BATCH_SIZE = 1024
 SEQ_LENGTH = 8
 ENCODE = True
 DECODE = False
 VOCAB_SIZE = 256
 LOG_TRAINING = 1000
 SEED = 42
-TMP_DIR = "tmp"
-FILE_PATH = "data/enwik8"
-COMPRESSED_FILE = "enwik8_1"
 
 # MODEL CONFIG
 VOCAB_DIM = 64
-HIDDEN_DIM = 256
+HIDDEN_DIM = 512
 N_LAYERS = 1
-FFN_DIM = 4096
-N_HEADS = 8
+FFN_DIM = 512
+N_HEADS = 2
 FEATURE_TYPE = 'sqr'
 COMPUTE_TYPE = 'iter'
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.0
 # END MODEL CONFIG
 
+TMP_DIR = "tmp"
+FILE_PATH = "data/enwik8"
+COMPRESSED_FILE = f"enwik8_{N_LAYERS}_{BATCH_SIZE}_{N_HEADS}_{FFN_DIM}_{HIDDEN_DIM}"
 
 # WANDB config
-wandb.init(
-    # set the wandb project where this run will be logged
-    project="compressdata",
+# wandb.init(
+#     # set the wandb project where this run will be logged
+#     project="compressdata",
 
-    # track hyperparameters and run metadata
-    config={
-        "learning_rate": LEARNING_RATE,
-        "architecture": "RWKV",
-        "dataset": FILE_PATH,
-        "epochs": 1,
-        "n_layers": N_LAYERS,
-        "ENCODE": ENCODE,
-        "DECODE": DECODE,
-    }
-)
+#     # track hyperparameters and run metadata
+#     config={
+#         "learning_rate": LEARNING_RATE,
+#         "architecture": "RWKV",
+#         "dataset": FILE_PATH,
+#         "epochs": 1,
+#         "n_layers": N_LAYERS,
+#         "ENCODE": ENCODE,
+#         "DECODE": DECODE,
+#         "HIDDEN_DIM": HIDDEN_DIM,
+#         "FFN_DIM": FFN_DIM,
+#         "N_HEADS": N_HEADS,
+#     }
+# )
 # END WANDB config
 
 
 def var_int_encode(byte_str_len, f):
-    #print(byte_str_len, end=" ")
+    # print(byte_str_len, end=" ")
 
     while byte_str_len > 0:
         this_byte = byte_str_len & 127
@@ -81,7 +85,7 @@ def var_int_decode(f):
 
     while True:
         this_byte = struct.unpack('B', data)[0]
-        #print(this_byte, end=" ")
+        # print(this_byte, end=" ")
 
         byte_str_len += (this_byte & 127) * shift
 
@@ -94,7 +98,7 @@ def var_int_decode(f):
     return byte_str_len
 
 
-def decode_token(token): return str(chr(max(32, token)))
+def decode_token(token): return str(chr(token))
 
 
 def decode_tokens(tokens): return ''.join(list(map(decode_token, tokens)))
@@ -127,10 +131,17 @@ def decode(temp_dir, compressed_file, len_series, last):
     torch.manual_seed(SEED)
 
     model = GPT(GPTConfig(block_size=SEQ_LENGTH, vocab_size=VOCAB_SIZE,
-                          n_layer=N_LAYERS, n_head=N_HEADS,
-                          n_embd=VOCAB_DIM, dropout=0.0, bias=True))
+                         n_layer=N_LAYERS, n_head=N_HEADS,
+                         n_embd=VOCAB_DIM, dropout=0.0, bias=True))
+
+    #model = MambaLMHeadModel(MambaConfig(d_model=VOCAB_DIM,
+    #                                     n_layer=N_LAYERS, vocab_size=VOCAB_SIZE))
+
+    # model = MambaLMHeadModel(MambaConfig(
+    #     d_model=32, n_layer=N_LAYERS, vocab_size=VOCAB_SIZE))
     model = model.to(device)
-    #model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
+
+   # model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
     #                     N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
     #                     COMPUTE_TYPE).cuda()
     print(model)
@@ -138,13 +149,17 @@ def decode(temp_dir, compressed_file, len_series, last):
     optimizer = torch.optim.Adam(model.parameters(
     ), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=(.9, .999))
 
+    if torch.__version__ > "1.0.0":
+        print("Compiling model")
+        model = torch.compile(model)
     # training_start = time.time()
     model.train()
     for train_index in trange(iter_num-SEQ_LENGTH):
         train_batch = torch.LongTensor(
-            series_2d[:, train_index:train_index + SEQ_LENGTH]).cuda()
+            series_2d[:, train_index:train_index + SEQ_LENGTH])#.cuda()
+        train_batch = train_batch.to(device)
         logits, _ = model.forward(train_batch)
-        #logits = model.forward(train_batch)
+        # logits = model.forward(train_batch)
         prob = logits[:, -1, :]
         prob = F.softmax(prob, dim=1).detach().cpu().numpy()
 
@@ -157,11 +172,12 @@ def decode(temp_dir, compressed_file, len_series, last):
 
         logits = logits.transpose(1, 2)
         label = torch.from_numpy(
-            series_2d[:, train_index+1:train_index+SEQ_LENGTH+1]).cuda()
+            series_2d[:, train_index+1:train_index+SEQ_LENGTH+1])#.cuda()
+        label = label.to(device)
         train_loss = torch.nn.functional.cross_entropy(
             logits[:, :, -1], label[:, -1], reduction='mean')
 
-        wandb.log({"loss": train_loss})
+        # wandb.log({"loss": train_loss})
         train_loss.backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -195,7 +211,7 @@ def decode(temp_dir, compressed_file, len_series, last):
         bitin.close()
         f.close()
 
-        wandb.finish()
+        # wandb.finish()
         return
 
 
@@ -228,7 +244,9 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
                           n_layer=N_LAYERS, n_head=N_HEADS,
                           n_embd=VOCAB_DIM, dropout=0.0, bias=True))
 
-    #model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
+    # model = MambaLMHeadModel(MambaConfig(
+    #     d_model=32, n_layer=N_LAYERS, vocab_size=VOCAB_SIZE))
+    # model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
     #                      N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
     #                      COMPUTE_TYPE)
 
@@ -245,14 +263,14 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
     optim = torch.optim.Adam(
         model.parameters(), LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     model.train()
-    print("Number of iterations",iter_num)
+    print("Number of iterations", iter_num)
     for train_index in trange(iter_num):
         train_batch = train_data[ind, :]
         y = train_batch[:, -1]
-        train_batch = torch.from_numpy(train_batch).cuda().long()
-
+        train_batch = torch.from_numpy(train_batch).long()#.cuda().long()
+        train_batch = train_batch.to(device)
         train_loss, logits = model.full_loss(train_batch, with_grad=True)
-        wandb.log({"loss": train_loss})
+        # wandb.log({"loss": train_loss})
         optim.step()
         optim.zero_grad(set_to_none=True)
 
@@ -271,6 +289,7 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
                 size += os.path.getsize(temp_dir+"/"+cf)
             print(train_index, ":", train_loss.item() /
                   np.log(2), "size:", size/(1024*1024))
+            # wandb.log({"size (bytes)": size})
 
     for i in range(BATCH_SIZE):
         enc[i].finish()
@@ -298,7 +317,6 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
         f.close()
 
 
-
 def main():
     torch.manual_seed(SEED)
     np.random.seed(SEED)
@@ -316,7 +334,9 @@ def main():
         return np.lib.stride_tricks.as_strided(a, shape=(nrows, L), strides=(S * n, n))
 
     global SEQ_LENGTH
+    # print(SEQ_LENGTH)
     SEQ_LENGTH = SEQ_LENGTH*(HIDDEN_DIM // VOCAB_DIM)
+    # print(SEQ_LENGTH)
 
     with open(file_path, "rb") as f:
         series = np.frombuffer(f.read(), dtype=np.uint8)
@@ -327,7 +347,6 @@ def main():
     if ENCODE and total_length % BATCH_SIZE == 0:
         encode(temp_dir, compressed_file, series, training_data, None)
     elif ENCODE:
-        # encode(temp_dir, compressed_file, series, training_data, None)
         last_lines = total_length // BATCH_SIZE * BATCH_SIZE
         encode(temp_dir, compressed_file,
                series[:last_lines + SEQ_LENGTH], training_data[:last_lines],
