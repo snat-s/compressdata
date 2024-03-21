@@ -4,7 +4,6 @@ Check references at docs/references.
 
 I am using RWKV for compression. It is pretty good, the layers are stackable.
 
-|----------------------------------------------|----------------|-----------|----------------|
 | N Layers                                     | kb/min         | # Params  | gpu allocation |
 |----------------------------------------------|----------------|-----------|----------------|
 | RWKV 1                                       | "1202,36"      | 0.06M     | 1.09G          |
