@@ -21,13 +21,14 @@ BATCH_SIZE = 512
 SHOULD_SAVE = True
 SEQ_LENGTH = 8
 ENCODE = True
-DECODE = False
+DECODE = True
 VOCAB_SIZE = 256
 LOG_TRAINING = 1000
 SEED = 42
 TMP_DIR = "tmp"
-FILE_PATH = "data/enwik8"
-COMPRESSED_FILE = "enwik8_1"
+FILE_PATH = "data/alice29.txt"
+COMPRESSED_FILE = "alice29"
+WANDB = False
 
 # MODEL CONFIG
 VOCAB_DIM = 64
@@ -43,26 +44,27 @@ WEIGHT_DECAY = 0.0
 
 
 # WANDB config
-wandb.init(
-    # set the wandb project where this run will be logged
-    project="compressdata",
+if WANDB:
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="compressdata",
 
-    # track hyperparameters and run metadata
-    config={
-        "learning_rate": LEARNING_RATE,
-        "architecture": "RWKV",
-        "dataset": FILE_PATH,
-        "epochs": 1,
-        "n_layers": N_LAYERS,
-        "ENCODE": ENCODE,
-        "DECODE": DECODE,
-    }
-)
+        # track hyperparameters and run metadata
+        config={
+            "learning_rate": LEARNING_RATE,
+            "architecture": "RWKV",
+            "dataset": FILE_PATH,
+            "epochs": 1,
+            "n_layers": N_LAYERS,
+            "ENCODE": ENCODE,
+            "DECODE": DECODE,
+        }
+    )
 # END WANDB config
 
 
 def var_int_encode(byte_str_len, f):
-    #print(byte_str_len, end=" ")
+    # print(byte_str_len, end=" ")
 
     while byte_str_len > 0:
         this_byte = byte_str_len & 127
@@ -81,7 +83,7 @@ def var_int_decode(f):
 
     while True:
         this_byte = struct.unpack('B', data)[0]
-        #print(this_byte, end=" ")
+        # print(this_byte, end=" ")
 
         byte_str_len += (this_byte & 127) * shift
 
@@ -94,7 +96,7 @@ def var_int_decode(f):
     return byte_str_len
 
 
-def decode_token(token): return str(chr(max(32, token)))
+def decode_token(token): return str(chr(token))
 
 
 def decode_tokens(tokens): return ''.join(list(map(decode_token, tokens)))
@@ -130,7 +132,7 @@ def decode(temp_dir, compressed_file, len_series, last):
                           n_layer=N_LAYERS, n_head=N_HEADS,
                           n_embd=VOCAB_DIM, dropout=0.0, bias=True))
     model = model.to(device)
-    #model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
+    # model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
     #                     N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
     #                     COMPUTE_TYPE).cuda()
     print(model)
@@ -144,7 +146,7 @@ def decode(temp_dir, compressed_file, len_series, last):
         train_batch = torch.LongTensor(
             series_2d[:, train_index:train_index + SEQ_LENGTH]).cuda()
         logits, _ = model.forward(train_batch)
-        #logits = model.forward(train_batch)
+        # logits = model.forward(train_batch)
         prob = logits[:, -1, :]
         prob = F.softmax(prob, dim=1).detach().cpu().numpy()
 
@@ -160,8 +162,8 @@ def decode(temp_dir, compressed_file, len_series, last):
             series_2d[:, train_index+1:train_index+SEQ_LENGTH+1]).cuda()
         train_loss = torch.nn.functional.cross_entropy(
             logits[:, :, -1], label[:, -1], reduction='mean')
-
-        wandb.log({"loss": train_loss})
+        if WANDB:
+            wandb.log({"loss": train_loss})
         train_loss.backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -194,8 +196,8 @@ def decode(temp_dir, compressed_file, len_series, last):
         print(decode_tokens(series))
         bitin.close()
         f.close()
-
-        wandb.finish()
+        if WANDB:
+            wandb.finish()
         return
 
 
@@ -228,7 +230,7 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
                           n_layer=N_LAYERS, n_head=N_HEADS,
                           n_embd=VOCAB_DIM, dropout=0.0, bias=True))
 
-    #model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
+    # model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
     #                      N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
     #                      COMPUTE_TYPE)
 
@@ -245,14 +247,15 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
     optim = torch.optim.Adam(
         model.parameters(), LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     model.train()
-    print("Number of iterations",iter_num)
+    print("Number of iterations", iter_num)
     for train_index in trange(iter_num):
         train_batch = train_data[ind, :]
         y = train_batch[:, -1]
         train_batch = torch.from_numpy(train_batch).cuda().long()
 
         train_loss, logits = model.full_loss(train_batch, with_grad=True)
-        wandb.log({"loss": train_loss})
+        if WANDB:
+            wandb.log({"loss": train_loss})
         optim.step()
         optim.zero_grad(set_to_none=True)
 
@@ -296,7 +299,6 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
         enc.finish()
         bitout.close()
         f.close()
-
 
 
 def main():
