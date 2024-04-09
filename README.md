@@ -16,8 +16,6 @@ I am using RWKV for compression. It is pretty good, the layers are stackable.
 | "TRACE (Mao, Y. et. al, 2022)"               | "952,3"        | 2.40M     | 2.02G          |
 | "TRACE+BP controller (Mao, Y. et. al, 2022)" | "1228,8"       | 2.40M     | 2.02G          |
 
-TRACE+BP is not open source, and they use a better graphics card, I have to test because I think
-in my computer it would be a lot slower.
 
 | Name of document         | Ratio | File size | Type        |
 |--------------------------|-------|-----------|-------------|
