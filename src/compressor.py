@@ -10,38 +10,40 @@ import struct
 import shutil
 import wandb
 
-import arithmeticcoding
-from transformer_model import SLiMPerformer
-from model import GPT, GPTConfig
-from mamba_ssm import Mamba
 from tqdm import trange
 
+import arithmeticcoding
+from transformer_model import SLiMPerformer
+from rwkv_model import GPT, GPTConfig
+from mamba_model import MambaLMHeadModel, MambaConfig
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 512
+BATCH_SIZE = 1024
 SHOULD_SAVE = True
 SEQ_LENGTH = 8
 ENCODE = True
-DECODE = True
+DECODE = False
 VOCAB_SIZE = 256
 LOG_TRAINING = 1000
 SEED = 42
 TMP_DIR = "tmp"
-FILE_PATH = "data/alice29.txt"
-COMPRESSED_FILE = "alice29"
-WANDB = False
+FILE_PATH = "data/enwik8"
+WANDB = True
 
 # MODEL CONFIG
-VOCAB_DIM = 64
-HIDDEN_DIM = 256
+VOCAB_DIM = 4
+HIDDEN_DIM = 4
 N_LAYERS = 1
-FFN_DIM = 4096
-N_HEADS = 8
+FFN_DIM = 128
+N_HEADS = 4
 FEATURE_TYPE = 'sqr'
 COMPUTE_TYPE = 'iter'
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.0
+ARCHITECTURE = "MAMBA"
 # END MODEL CONFIG
 
+COMPRESSED_FILE = f"enwik8_{BATCH_SIZE}_{HIDDEN_DIM}_{N_LAYERS}_{VOCAB_SIZE}_{N_HEADS}_{ARCHITECTURE}"
 
 # WANDB config
 if WANDB:
@@ -52,12 +54,16 @@ if WANDB:
         # track hyperparameters and run metadata
         config={
             "learning_rate": LEARNING_RATE,
-            "architecture": "RWKV",
+            "architecture": ARCHITECTURE,
             "dataset": FILE_PATH,
             "epochs": 1,
             "n_layers": N_LAYERS,
             "ENCODE": ENCODE,
+            "vocab_dim": VOCAB_DIM,
+            "hidden_dim": HIDDEN_DIM,
+            "ffn_dim": FFN_DIM,
             "DECODE": DECODE,
+            "heads": N_HEADS,
         }
     )
 # END WANDB config
@@ -102,11 +108,25 @@ def decode_token(token): return str(chr(token))
 def decode_tokens(tokens): return ''.join(list(map(decode_token, tokens)))
 
 
+def get_model():
+    model = None
+    if ARCHITECTURE == "RWKV":
+        model = GPT(GPTConfig(block_size=SEQ_LENGTH, vocab_size=VOCAB_SIZE,
+                              n_layer=N_LAYERS, n_head=N_HEADS,
+                              n_embd=VOCAB_DIM, dropout=0.0, bias=True))
+    elif ARCHITECTURE == "TRANSFORMER":
+        model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
+                              N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
+                              COMPUTE_TYPE)
+    elif ARCHITECTURE == "MAMBA":
+        model = MambaLMHeadModel(MambaConfig(
+            d_model=HIDDEN_DIM, n_layer=N_LAYERS, vocab_size=VOCAB_SIZE))
+    return model
+
+
 def decode(temp_dir, compressed_file, len_series, last):
 
     iter_num = (len_series - SEQ_LENGTH) // BATCH_SIZE
-    ind = np.array(range(BATCH_SIZE))*iter_num
-    print(iter_num - SEQ_LENGTH)
     series_2d = np.zeros((BATCH_SIZE, iter_num), dtype=np.uint8).astype('int')
 
     f = [open(os.path.join(temp_dir, compressed_file)+'.'+str(i), 'rb')
@@ -128,13 +148,8 @@ def decode(temp_dir, compressed_file, len_series, last):
     np.random.seed(SEED)
     torch.manual_seed(SEED)
 
-    model = GPT(GPTConfig(block_size=SEQ_LENGTH, vocab_size=VOCAB_SIZE,
-                          n_layer=N_LAYERS, n_head=N_HEADS,
-                          n_embd=VOCAB_DIM, dropout=0.0, bias=True))
+    model = get_model()
     model = model.to(device)
-    # model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
-    #                     N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
-    #                     COMPUTE_TYPE).cuda()
     print(model)
 
     optimizer = torch.optim.Adam(model.parameters(
@@ -144,9 +159,12 @@ def decode(temp_dir, compressed_file, len_series, last):
     model.train()
     for train_index in trange(iter_num-SEQ_LENGTH):
         train_batch = torch.LongTensor(
-            series_2d[:, train_index:train_index + SEQ_LENGTH]).cuda()
-        logits, _ = model.forward(train_batch)
-        # logits = model.forward(train_batch)
+            series_2d[:, train_index:train_index + SEQ_LENGTH]).to(device)
+        if isinstance(model, GPT) or isinstance(model, SLiMPerformer):
+            logits, _ = model.forward(train_batch)
+        else:
+            logits = model.forward(train_batch, position_ids=1).logits
+        # print(logits.shape)
         prob = logits[:, -1, :]
         prob = F.softmax(prob, dim=1).detach().cpu().numpy()
 
@@ -156,12 +174,19 @@ def decode(temp_dir, compressed_file, len_series, last):
         for i in range(BATCH_SIZE):
             series_2d[i, train_index +
                       SEQ_LENGTH] = dec[i].read(cumul_batch[i, :], VOCAB_SIZE)
+        if isinstance(model, GPT) or isinstance(model, SLiMPerformer):
+            logits = logits.transpose(1, 2)
 
-        logits = logits.transpose(1, 2)
         label = torch.from_numpy(
-            series_2d[:, train_index+1:train_index+SEQ_LENGTH+1]).cuda()
-        train_loss = torch.nn.functional.cross_entropy(
-            logits[:, :, -1], label[:, -1], reduction='mean')
+            series_2d[:, train_index+1:train_index+SEQ_LENGTH+1]).to(device)
+        # print(logits[:, -1, :].shape, label[:, -1].shape)
+        # exit()
+        if isinstance(model, GPT) or isinstance(model, SLiMPerformer):
+            train_loss = torch.nn.functional.cross_entropy(
+                logits[:, :, -1], label[:, -1], reduction='mean')
+        else:
+            train_loss = torch.nn.functional.cross_entropy(
+                logits[:, -1, :], label[:, -1])
         if WANDB:
             wandb.log({"loss": train_loss})
         train_loss.backward()
@@ -198,7 +223,7 @@ def decode(temp_dir, compressed_file, len_series, last):
         f.close()
         if WANDB:
             wandb.finish()
-        return
+    return
 
 
 def encode(temp_dir, compressed_file, series, train_data, last_train_data):
@@ -226,21 +251,14 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
             enc[i].write(cumul, series[ind[i]+j])
 
     cumul_batch = np.zeros((BATCH_SIZE, VOCAB_SIZE+1), dtype=np.uint64)
-    model = GPT(GPTConfig(block_size=SEQ_LENGTH, vocab_size=VOCAB_SIZE,
-                          n_layer=N_LAYERS, n_head=N_HEADS,
-                          n_embd=VOCAB_DIM, dropout=0.0, bias=True))
-
-    # model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
-    #                      N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
-    #                      COMPUTE_TYPE)
-
+    model = get_model()
     total_params = sum(p.numel() for p in model.parameters())
+    # exit()
     model = model.to(device)
 
     print(f"The model has {total_params} parameters")
-    # print(model)
-
-    if torch.__version__ > "1.0.0":
+    print(model)
+    if torch.__version__ > "1.0.0" and (isinstance(model, GPT) or isinstance(model, SLiMPerformer)):
         print("Compiling model")
         model = torch.compile(model)
 
@@ -251,15 +269,19 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
     for train_index in trange(iter_num):
         train_batch = train_data[ind, :]
         y = train_batch[:, -1]
-        train_batch = torch.from_numpy(train_batch).cuda().long()
+        train_batch = torch.from_numpy(train_batch).long().to(device)
 
         train_loss, logits = model.full_loss(train_batch, with_grad=True)
+
         if WANDB:
             wandb.log({"loss": train_loss})
+
         optim.step()
         optim.zero_grad(set_to_none=True)
 
-        logits = logits.transpose(1, 2)
+        if isinstance(model, GPT) or isinstance(model, SLiMPerformer):
+            logits = logits.transpose(1, 2)
+
         prob = logits[:, -1, :]
         prob = F.softmax(prob, dim=1).detach().cpu().numpy()
         cumul_batch[:, 1:] = np.cumsum(prob*10000000 + 1, axis=1)
@@ -274,6 +296,8 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
                 size += os.path.getsize(temp_dir+"/"+cf)
             print(train_index, ":", train_loss.item() /
                   np.log(2), "size:", size/(1024*1024))
+            if WANDB:
+                wandb.log({"size": size})
 
     for i in range(BATCH_SIZE):
         enc[i].finish()
@@ -301,6 +325,12 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
         f.close()
 
 
+def strided_app(a, L, S):  # Window len = L, Stride len/stepsize = S
+    nrows = ((a.size - L) // S) + 1
+    n = a.strides[0]
+    return np.lib.stride_tricks.as_strided(a, shape=(nrows, L), strides=(S * n, n))
+
+
 def main():
     torch.manual_seed(SEED)
     np.random.seed(SEED)
@@ -312,13 +342,9 @@ def main():
         os.mkdir(temp_dir)
         print(f"Created directory at {temp_dir}")
 
-    def strided_app(a, L, S):  # Window len = L, Stride len/stepsize = S
-        nrows = ((a.size - L) // S) + 1
-        n = a.strides[0]
-        return np.lib.stride_tricks.as_strided(a, shape=(nrows, L), strides=(S * n, n))
-
     global SEQ_LENGTH
     SEQ_LENGTH = SEQ_LENGTH*(HIDDEN_DIM // VOCAB_DIM)
+    print("SEQ_LENGTH", SEQ_LENGTH)
 
     with open(file_path, "rb") as f:
         series = np.frombuffer(f.read(), dtype=np.uint8)
@@ -329,7 +355,6 @@ def main():
     if ENCODE and total_length % BATCH_SIZE == 0:
         encode(temp_dir, compressed_file, series, training_data, None)
     elif ENCODE:
-        # encode(temp_dir, compressed_file, series, training_data, None)
         last_lines = total_length // BATCH_SIZE * BATCH_SIZE
         encode(temp_dir, compressed_file,
                series[:last_lines + SEQ_LENGTH], training_data[:last_lines],

@@ -5,9 +5,13 @@ src/wandb/
 src/decompresssed
 src/enwik4
 src/enwik4.compressed
+*.compressed
+src/decompressed_file
 
 
 # Byte-compiled / optimized / DLL files
+src/.ipynb_checkpoints/
+src/mambababa/
 __pycache__/
 *.pyc
 *.pyo
