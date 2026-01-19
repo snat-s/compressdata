@@ -13,16 +13,16 @@ import shutil
 import arithmeticcoding
 from transformer_model import SLiMPerformer
 from model import GPT, GPTConfig
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.models.config_mamba import MambaConfig
+# from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+# from mamba_ssm.models.config_mamba import MambaConfig
 from tqdm import trange
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
-BATCH_SIZE = 1024
+BATCH_SIZE = 64 
 SEQ_LENGTH = 8
-ENCODE = True
-DECODE = False
+ENCODE = True 
+DECODE = False 
 VOCAB_SIZE = 256
 LOG_TRAINING = 1000
 SEED = 42
@@ -30,7 +30,7 @@ SEED = 42
 # MODEL CONFIG
 VOCAB_DIM = 64
 HIDDEN_DIM = 512
-N_LAYERS = 1
+N_LAYERS = 64
 FFN_DIM = 512
 N_HEADS = 2
 FEATURE_TYPE = 'sqr'
@@ -40,8 +40,8 @@ WEIGHT_DECAY = 0.0
 # END MODEL CONFIG
 
 TMP_DIR = "tmp"
-FILE_PATH = "data/enwik8"
-COMPRESSED_FILE = f"enwik8_{N_LAYERS}_{BATCH_SIZE}_{N_HEADS}_{FFN_DIM}_{HIDDEN_DIM}"
+FILE_PATH = "src/data/alice.txt"
+COMPRESSED_FILE = f"alice_{N_LAYERS}_{BATCH_SIZE}_{N_HEADS}_{FFN_DIM}_{HIDDEN_DIM}"
 
 # WANDB config
 # wandb.init(
@@ -149,27 +149,30 @@ def decode(temp_dir, compressed_file, len_series, last):
     optimizer = torch.optim.Adam(model.parameters(
     ), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=(.9, .999))
 
-    if torch.__version__ > "1.0.0":
-        print("Compiling model")
-        model = torch.compile(model)
+    # if torch.__version__ > "1.0.0":
+    #     print("Compiling model")
+    #     model = torch.compile(model)
     # training_start = time.time()
     model.train()
     for train_index in trange(iter_num-SEQ_LENGTH):
+        # Get current batch
         train_batch = torch.LongTensor(
             series_2d[:, train_index:train_index + SEQ_LENGTH])#.cuda()
         train_batch = train_batch.to(device)
+
+        # Forward pass to get logits for prediction
         logits, _ = model.forward(train_batch)
-        # logits = model.forward(train_batch)
         prob = logits[:, -1, :]
         prob = F.softmax(prob, dim=1).detach().cpu().numpy()
 
         cumul_batch[:, 1:] = np.cumsum(prob*10000000 + 1, axis=1)
 
-        # Decode with Arithmetic Encoder
+        # Decode the next byte using predictions from BEFORE weight update
         for i in range(BATCH_SIZE):
             series_2d[i, train_index +
                       SEQ_LENGTH] = dec[i].read(cumul_batch[i, :], VOCAB_SIZE)
 
+        # Now train on this batch (compute loss and update weights)
         logits = logits.transpose(1, 2)
         label = torch.from_numpy(
             series_2d[:, train_index+1:train_index+SEQ_LENGTH+1])#.cuda()
@@ -185,15 +188,19 @@ def decode(temp_dir, compressed_file, len_series, last):
         if train_index % LOG_TRAINING == 0:
             print(train_index, ":", train_loss.item()/np.log(2))
 
-    out = open('decompressed_file', 'w')
+    out = open('decompressed_file', 'wb')
+    # Write streams sequentially - each stream contains a contiguous chunk
+    # Convert to uint8 before writing to ensure proper byte representation
     for i in range(len(series_2d)):
-        out.write(decode_tokens(series_2d[i]))
+        out.write(series_2d[i].astype(np.uint8).tobytes())
+    out.close()
 
     for i in range(BATCH_SIZE):
         bitin[i].close()
         f[i].close()
 
     if last:
+        out = open('decompressed_file', 'ab')  # Reopen in binary append mode for last part
         series = np.zeros(last, dtype=np.uint8).astype('int')
         f = open(os.path.join(temp_dir, compressed_file)+'.last', 'rb')
         bitin = arithmeticcoding.BitInputStream(f)
@@ -206,8 +213,9 @@ def decode(temp_dir, compressed_file, len_series, last):
             series[j] = dec.read(cumul, VOCAB_SIZE)
 
         print("Last decode part don't need inference.")
-        out.write(decode_tokens(series))
+        out.write(series.astype(np.uint8).tobytes())
         print(decode_tokens(series))
+        out.close()
         bitin.close()
         f.close()
 
@@ -256,9 +264,9 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
     print(f"The model has {total_params} parameters")
     # print(model)
 
-    if torch.__version__ > "1.0.0":
-        print("Compiling model")
-        model = torch.compile(model)
+    # if torch.__version__ > "1.0.0":
+    #     print("Compiling model")
+    #     model = torch.compile(model)
 
     optim = torch.optim.Adam(
         model.parameters(), LEARNING_RATE, weight_decay=WEIGHT_DECAY)
