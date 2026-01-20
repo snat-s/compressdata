@@ -13,35 +13,60 @@ import shutil
 import arithmeticcoding
 from transformer_model import SLiMPerformer
 from model import GPT, GPTConfig
+from rwkv_v7 import RWKVv7LM, RWKVv7Config
 # from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 # from mamba_ssm.models.config_mamba import MambaConfig
 from tqdm import trange
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
-BATCH_SIZE = 64 
+BATCH_SIZE = 1024 
 SEQ_LENGTH = 8
 ENCODE = True 
-DECODE = False 
+DECODE = True 
 VOCAB_SIZE = 256
-LOG_TRAINING = 1000
+LOG_TRAINING = 10000
 SEED = 42
 
-# MODEL CONFIG
-VOCAB_DIM = 64
-HIDDEN_DIM = 512
-N_LAYERS = 64
-FFN_DIM = 512
-N_HEADS = 2
+# MODEL CONFIG - Optimized for 8-hour enwik8 run
+MODEL_TYPE = "rwkv_v7"  # Options: "gpt", "rwkv_v7", "slim_performer"
+VOCAB_DIM = 128
+HIDDEN_DIM = 128
+N_LAYERS = 8
+#FFN_DIM = 256           # Only used by slim_performer
+N_HEADS = 4             # Head size = 64/2 = 32
 FEATURE_TYPE = 'sqr'
 COMPUTE_TYPE = 'iter'
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 5e-4    # Lower for stability over millions of steps
 WEIGHT_DECAY = 0.0
 # END MODEL CONFIG
 
+
+def build_model(model_type, seq_length):
+    """Factory function to create model based on MODEL_TYPE."""
+    if model_type == "gpt":
+        return GPT(GPTConfig(
+            block_size=seq_length, vocab_size=VOCAB_SIZE,
+            n_layer=N_LAYERS, n_head=N_HEADS,
+            n_embd=VOCAB_DIM, dropout=0.0, bias=True
+        ))
+    elif model_type == "rwkv_v7":
+        return RWKVv7LM(RWKVv7Config(
+            block_size=seq_length, vocab_size=VOCAB_SIZE,
+            n_layer=N_LAYERS, n_head=N_HEADS,
+            n_embd=VOCAB_DIM, dropout=0.0, bias=True
+        ))
+    elif model_type == "slim_performer":
+        return SLiMPerformer(
+            VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
+            N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE, COMPUTE_TYPE
+        )
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
 TMP_DIR = "tmp"
-FILE_PATH = "src/data/alice.txt"
-COMPRESSED_FILE = f"alice_{N_LAYERS}_{BATCH_SIZE}_{N_HEADS}_{FFN_DIM}_{HIDDEN_DIM}"
+FILE_PATH = "src/data/enwik8"
+COMPRESSED_FILE = f"enwik8_{N_LAYERS}L_{VOCAB_DIM}d_{N_HEADS}h_b{BATCH_SIZE}"
 
 # WANDB config
 # wandb.init(
@@ -130,20 +155,8 @@ def decode(temp_dir, compressed_file, len_series, last):
     np.random.seed(SEED)
     torch.manual_seed(SEED)
 
-    model = GPT(GPTConfig(block_size=SEQ_LENGTH, vocab_size=VOCAB_SIZE,
-                         n_layer=N_LAYERS, n_head=N_HEADS,
-                         n_embd=VOCAB_DIM, dropout=0.0, bias=True))
-
-    #model = MambaLMHeadModel(MambaConfig(d_model=VOCAB_DIM,
-    #                                     n_layer=N_LAYERS, vocab_size=VOCAB_SIZE))
-
-    # model = MambaLMHeadModel(MambaConfig(
-    #     d_model=32, n_layer=N_LAYERS, vocab_size=VOCAB_SIZE))
+    model = build_model(MODEL_TYPE, SEQ_LENGTH)
     model = model.to(device)
-
-   # model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
-    #                     N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
-    #                     COMPUTE_TYPE).cuda()
     print(model)
 
     optimizer = torch.optim.Adam(model.parameters(
@@ -248,19 +261,10 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
             enc[i].write(cumul, series[ind[i]+j])
 
     cumul_batch = np.zeros((BATCH_SIZE, VOCAB_SIZE+1), dtype=np.uint64)
-    model = GPT(GPTConfig(block_size=SEQ_LENGTH, vocab_size=VOCAB_SIZE,
-                          n_layer=N_LAYERS, n_head=N_HEADS,
-                          n_embd=VOCAB_DIM, dropout=0.0, bias=True))
-
-    # model = MambaLMHeadModel(MambaConfig(
-    #     d_model=32, n_layer=N_LAYERS, vocab_size=VOCAB_SIZE))
-    # model = SLiMPerformer(VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
-    #                      N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE,
-    #                      COMPUTE_TYPE)
-
-    total_params = sum(p.numel() for p in model.parameters())
+    model = build_model(MODEL_TYPE, SEQ_LENGTH)
     model = model.to(device)
 
+    total_params = sum(p.numel() for p in model.parameters())
     print(f"The model has {total_params} parameters")
     # print(model)
 
