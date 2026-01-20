@@ -30,14 +30,14 @@ SEED = 42
 
 # MODEL CONFIG - Optimized for 8-hour enwik8 run
 MODEL_TYPE = "rwkv_v7"  # Options: "gpt", "rwkv_v7", "slim_performer"
-VOCAB_DIM = 128
-HIDDEN_DIM = 128
-N_LAYERS = 8
+VOCAB_DIM = 256
+HIDDEN_DIM = 256
+N_LAYERS = 12
 #FFN_DIM = 256           # Only used by slim_performer
-N_HEADS = 4             # Head size = 64/2 = 32
+N_HEADS = 8             # Head size = 256/8 = 32
 FEATURE_TYPE = 'sqr'
 COMPUTE_TYPE = 'iter'
-LEARNING_RATE = 5e-4    # Lower for stability over millions of steps
+LEARNING_RATE = 3e-4    # Stable for long runs
 WEIGHT_DECAY = 0.0
 # END MODEL CONFIG
 
