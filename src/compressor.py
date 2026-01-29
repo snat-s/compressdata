@@ -22,27 +22,34 @@ from tqdm import trange
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
-BATCH_SIZE = 1024 
-SEQ_LENGTH = 8
+BATCH_SIZE = 1024
+SEQ_LENGTH = 64  # Increased from 8 - longer context = better compression (NNCP uses long contexts)
 ENCODE = True 
 DECODE = True 
 VOCAB_SIZE = 256
 LOG_TRAINING = 10000
 SEED = 42
 
-# MODEL CONFIG - Optimized for 8-hour enwik8 run
+# MODEL CONFIG - Optimized for enwik8 compression
+# Incorporates learnings from Bellard's NNCP (https://bellard.org/nncp/)
 MODEL_TYPE = "modern_gpt"  # Options: "gpt", "rwkv_v7", "slim_performer", "modern_gpt"
 VOCAB_DIM = 256
-HIDDEN_DIM = 256
+HIDDEN_DIM = 384        # Increased for better capacity
 N_LAYERS = 12
 #FFN_DIM = 256           # Only used by slim_performer
-N_HEADS = 8             # Head size = 256/8 = 32
+N_HEADS = 8             # Head size = 384/8 = 48
 FEATURE_TYPE = 'sqr'
 COMPUTE_TYPE = 'iter'
 LEARNING_RATE = 3e-4    # Stable for long runs (used for AdamW params in modern_gpt)
 WEIGHT_DECAY = 0.0
 USE_MUON = True         # Use Muon optimizer for modern_gpt (better than Adam)
 MUON_LR = 0.02          # Learning rate for Muon optimizer
+
+# NNCP-inspired settings
+# Bellard emphasizes gradient clipping is "essential to avoid divergence"
+GRAD_CLIP = 1.0         # Gradient norm clipping (0 to disable)
+# NNCP key insight: "overfitting" is GOOD for compression - train multiple steps per batch
+TRAIN_STEPS_PER_BATCH = 3  # Number of gradient steps per batch (1 = original behavior)
 # END MODEL CONFIG
 
 
@@ -186,36 +193,43 @@ def decode(temp_dir, compressed_file, len_series, last):
     #     model = torch.compile(model)
     # training_start = time.time()
     model.train()
+    print(f"Training {TRAIN_STEPS_PER_BATCH} steps per batch (NNCP-style overfitting)")
     for train_index in trange(iter_num-SEQ_LENGTH):
         # Get current batch
         train_batch = torch.LongTensor(
-            series_2d[:, train_index:train_index + SEQ_LENGTH])#.cuda()
+            series_2d[:, train_index:train_index + SEQ_LENGTH])
         train_batch = train_batch.to(device)
 
-        # Forward pass to get logits for prediction
-        logits, _ = model.forward(train_batch)
-        prob = logits[:, -1, :]
-        prob = F.softmax(prob, dim=1).detach().cpu().numpy()
-
-        cumul_batch[:, 1:] = np.cumsum(prob*10000000 + 1, axis=1)
+        # Forward pass to get logits for prediction (before training)
+        with torch.no_grad():
+            logits, _ = model.forward(train_batch)
+            prob = F.softmax(logits[:, -1, :], dim=1).cpu().numpy()
+            cumul_batch[:, 1:] = np.cumsum(prob*10000000 + 1, axis=1)
 
         # Decode the next byte using predictions from BEFORE weight update
         for i in range(BATCH_SIZE):
             series_2d[i, train_index +
                       SEQ_LENGTH] = dec[i].read(cumul_batch[i, :], VOCAB_SIZE)
 
-        # Now train on this batch (compute loss and update weights)
-        logits = logits.transpose(1, 2)
-        label = torch.from_numpy(
-            series_2d[:, train_index+1:train_index+SEQ_LENGTH+1])#.cuda()
-        label = label.to(device)
-        train_loss = torch.nn.functional.cross_entropy(
-            logits[:, :, -1], label[:, -1], reduction='mean')
+        # Now train on this batch - NNCP insight: multiple steps to overfit
+        # Build full training batch with the newly decoded token
+        full_batch = torch.LongTensor(
+            series_2d[:, train_index:train_index + SEQ_LENGTH + 1]).to(device)
 
-        # wandb.log({"loss": train_loss})
-        train_loss.backward()
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        for _ in range(TRAIN_STEPS_PER_BATCH):
+            logits, _ = model.forward(full_batch[:, :-1])
+            logits = logits.transpose(1, 2)
+            train_loss = torch.nn.functional.cross_entropy(
+                logits[:, :, -1], full_batch[:, -1], reduction='mean')
+
+            train_loss.backward()
+
+            # NNCP insight: gradient clipping is essential for stable training
+            if GRAD_CLIP > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         if train_index % LOG_TRAINING == 0:
             print(train_index, ":", train_loss.item()/np.log(2))
@@ -303,23 +317,34 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
             model.parameters(), LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     model.train()
     print("Number of iterations", iter_num)
+    print(f"Training {TRAIN_STEPS_PER_BATCH} steps per batch (NNCP-style overfitting)")
     for train_index in trange(iter_num):
         train_batch = train_data[ind, :]
         y = train_batch[:, -1]
-        train_batch = torch.from_numpy(train_batch).long()#.cuda().long()
+        train_batch = torch.from_numpy(train_batch).long()
         train_batch = train_batch.to(device)
-        train_loss, logits = model.full_loss(train_batch, with_grad=True)
-        # wandb.log({"loss": train_loss})
-        optim.step()
-        optim.zero_grad(set_to_none=True)
 
-        logits = logits.transpose(1, 2)
-        prob = logits[:, -1, :]
-        prob = F.softmax(prob, dim=1).detach().cpu().numpy()
-        cumul_batch[:, 1:] = np.cumsum(prob*10000000 + 1, axis=1)
+        # First forward pass - get predictions for encoding (before training on this batch)
+        with torch.no_grad():
+            logits, _ = model.forward(train_batch[:, :-1])
+            prob = F.softmax(logits[:, -1, :], dim=1).cpu().numpy()
+            cumul_batch[:, 1:] = np.cumsum(prob*10000000 + 1, axis=1)
 
+        # Encode with current model predictions
         for i in range(BATCH_SIZE):
             enc[i].write(cumul_batch[i, :], y[i])
+
+        # NNCP insight: train multiple steps to "overfit" on this data
+        # This is the key - we WANT the model to fit this specific data well
+        for _ in range(TRAIN_STEPS_PER_BATCH):
+            train_loss, logits = model.full_loss(train_batch, with_grad=True)
+
+            # NNCP insight: gradient clipping is essential for stable training
+            if GRAD_CLIP > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+
+            optim.step()
+            optim.zero_grad(set_to_none=True)
 
         ind += 1
         if train_index % LOG_TRAINING == 0:
