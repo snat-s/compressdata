@@ -14,6 +14,8 @@ import arithmeticcoding
 from transformer_model import SLiMPerformer
 from model import GPT, GPTConfig
 from rwkv_v7 import RWKVv7LM, RWKVv7Config
+from gpt_modern import ModernGPT, ModernGPTConfig
+from muon_optimizer import configure_optimizers
 # from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 # from mamba_ssm.models.config_mamba import MambaConfig
 from tqdm import trange
@@ -29,7 +31,7 @@ LOG_TRAINING = 10000
 SEED = 42
 
 # MODEL CONFIG - Optimized for 8-hour enwik8 run
-MODEL_TYPE = "rwkv_v7"  # Options: "gpt", "rwkv_v7", "slim_performer"
+MODEL_TYPE = "modern_gpt"  # Options: "gpt", "rwkv_v7", "slim_performer", "modern_gpt"
 VOCAB_DIM = 256
 HIDDEN_DIM = 256
 N_LAYERS = 12
@@ -37,8 +39,10 @@ N_LAYERS = 12
 N_HEADS = 8             # Head size = 256/8 = 32
 FEATURE_TYPE = 'sqr'
 COMPUTE_TYPE = 'iter'
-LEARNING_RATE = 3e-4    # Stable for long runs
+LEARNING_RATE = 3e-4    # Stable for long runs (used for AdamW params in modern_gpt)
 WEIGHT_DECAY = 0.0
+USE_MUON = True         # Use Muon optimizer for modern_gpt (better than Adam)
+MUON_LR = 0.02          # Learning rate for Muon optimizer
 # END MODEL CONFIG
 
 
@@ -61,6 +65,13 @@ def build_model(model_type, seq_length):
             VOCAB_SIZE, VOCAB_DIM, HIDDEN_DIM,
             N_LAYERS, FFN_DIM, N_HEADS, FEATURE_TYPE, COMPUTE_TYPE
         )
+    elif model_type == "modern_gpt":
+        return ModernGPT(ModernGPTConfig(
+            block_size=seq_length, vocab_size=VOCAB_SIZE,
+            n_layer=N_LAYERS, n_head=N_HEADS,
+            n_embd=VOCAB_DIM, dropout=0.0, bias=False,
+            use_flash=True  # Enable Flash Attention
+        ), use_swiglu=True)  # Use SwiGLU activation
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -159,8 +170,16 @@ def decode(temp_dir, compressed_file, len_series, last):
     model = model.to(device)
     print(model)
 
-    optimizer = torch.optim.Adam(model.parameters(
-    ), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=(.9, .999))
+    # Use Muon optimizer for modern_gpt if enabled, otherwise use Adam
+    if MODEL_TYPE == "modern_gpt" and USE_MUON:
+        optimizer = configure_optimizers(
+            model, muon_lr=MUON_LR, adamw_lr=LEARNING_RATE,
+            weight_decay=WEIGHT_DECAY, device_type='cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        print(f"Using Muon optimizer (muon_lr={MUON_LR}, adamw_lr={LEARNING_RATE})")
+    else:
+        optimizer = torch.optim.Adam(model.parameters(
+        ), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=(.9, .999))
 
     # if torch.__version__ > "1.0.0":
     #     print("Compiling model")
@@ -272,8 +291,16 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
     #     print("Compiling model")
     #     model = torch.compile(model)
 
-    optim = torch.optim.Adam(
-        model.parameters(), LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    # Use Muon optimizer for modern_gpt if enabled, otherwise use Adam
+    if MODEL_TYPE == "modern_gpt" and USE_MUON:
+        optim = configure_optimizers(
+            model, muon_lr=MUON_LR, adamw_lr=LEARNING_RATE,
+            weight_decay=WEIGHT_DECAY, device_type='cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        print(f"Using Muon optimizer (muon_lr={MUON_LR}, adamw_lr={LEARNING_RATE})")
+    else:
+        optim = torch.optim.Adam(
+            model.parameters(), LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     model.train()
     print("Number of iterations", iter_num)
     for train_index in trange(iter_num):
