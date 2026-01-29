@@ -8,7 +8,10 @@ import torch
 import torch.nn.functional as F
 import struct
 import shutil
-# import wandb
+# Conditional wandb - only enable if WANDB_API_KEY is set
+USE_WANDB = os.environ.get("WANDB_API_KEY") is not None
+if USE_WANDB:
+    import wandb
 
 import arithmeticcoding
 from transformer_model import SLiMPerformer
@@ -25,7 +28,7 @@ print(device)
 BATCH_SIZE = 1024 
 SEQ_LENGTH = 8
 ENCODE = True 
-DECODE = True 
+DECODE = False 
 VOCAB_SIZE = 256
 LOG_TRAINING = 10000
 SEED = 42
@@ -34,7 +37,7 @@ SEED = 42
 MODEL_TYPE = "modern_gpt"  # Options: "gpt", "rwkv_v7", "slim_performer", "modern_gpt"
 VOCAB_DIM = 256
 HIDDEN_DIM = 256
-N_LAYERS = 12
+N_LAYERS = 1
 #FFN_DIM = 256           # Only used by slim_performer
 N_HEADS = 8             # Head size = 256/8 = 32
 FEATURE_TYPE = 'sqr'
@@ -76,29 +79,24 @@ def build_model(model_type, seq_length):
         raise ValueError(f"Unknown model type: {model_type}")
 
 TMP_DIR = "tmp"
-FILE_PATH = "src/data/enwik8"
-COMPRESSED_FILE = f"enwik8_{N_LAYERS}L_{VOCAB_DIM}d_{N_HEADS}h_b{BATCH_SIZE}"
+FILE_PATH = "src/data/alice.txt"
+COMPRESSED_FILE = f"alice_{N_LAYERS}L_{VOCAB_DIM}d_{N_HEADS}h_b{BATCH_SIZE}"
 
-# WANDB config
-# wandb.init(
-#     # set the wandb project where this run will be logged
-#     project="compressdata",
-
-#     # track hyperparameters and run metadata
-#     config={
-#         "learning_rate": LEARNING_RATE,
-#         "architecture": "RWKV",
-#         "dataset": FILE_PATH,
-#         "epochs": 1,
-#         "n_layers": N_LAYERS,
-#         "ENCODE": ENCODE,
-#         "DECODE": DECODE,
-#         "HIDDEN_DIM": HIDDEN_DIM,
-#         "FFN_DIM": FFN_DIM,
-#         "N_HEADS": N_HEADS,
-#     }
-# )
-# END WANDB config
+# Initialize wandb if available
+if USE_WANDB:
+    wandb.init(
+        project="compressdata",
+        config={
+            "learning_rate": LEARNING_RATE,
+            "architecture": MODEL_TYPE,
+            "dataset": FILE_PATH,
+            "n_layers": N_LAYERS,
+            "hidden_dim": HIDDEN_DIM,
+            "n_heads": N_HEADS,
+            "batch_size": BATCH_SIZE,
+            "seq_length": SEQ_LENGTH,
+        }
+    )
 
 
 def var_int_encode(byte_str_len, f):
@@ -212,7 +210,8 @@ def decode(temp_dir, compressed_file, len_series, last):
         train_loss = torch.nn.functional.cross_entropy(
             logits[:, :, -1], label[:, -1], reduction='mean')
 
-        # wandb.log({"loss": train_loss})
+        if USE_WANDB:
+            wandb.log({"loss": train_loss.item()})
         train_loss.backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -251,7 +250,8 @@ def decode(temp_dir, compressed_file, len_series, last):
         bitin.close()
         f.close()
 
-        # wandb.finish()
+        if USE_WANDB:
+            wandb.finish()
         return
 
 
@@ -309,7 +309,8 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
         train_batch = torch.from_numpy(train_batch).long()#.cuda().long()
         train_batch = train_batch.to(device)
         train_loss, logits = model.full_loss(train_batch, with_grad=True)
-        # wandb.log({"loss": train_loss})
+        if USE_WANDB:
+            wandb.log({"loss": train_loss.item()})
         optim.step()
         optim.zero_grad(set_to_none=True)
 
@@ -328,7 +329,8 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
                 size += os.path.getsize(temp_dir+"/"+cf)
             print(train_index, ":", train_loss.item() /
                   np.log(2), "size:", size/(1024*1024))
-            # wandb.log({"size (bytes)": size})
+            if USE_WANDB:
+                wandb.log({"size_bytes": size})
 
     for i in range(BATCH_SIZE):
         enc[i].finish()
@@ -419,6 +421,8 @@ def main():
 
         print(total/(1024*1024))
         shutil.rmtree(temp_dir)
+        if USE_WANDB:
+            wandb.finish()
 
     if DECODE:
 
