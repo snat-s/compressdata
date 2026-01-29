@@ -393,30 +393,30 @@ class ModernGPT(nn.Module):
 
         return logits, loss
 
-    def full_loss(self, idx, with_grad=False):
+    def full_loss(self, inputs, with_grad=True):
         """
         Compute loss with optional gradient computation.
         Compatible with compressor.py interface.
 
         Args:
-            idx: input sequence (B, T)
-            with_grad: whether to compute gradients
+            inputs: input sequence (B, T+1) where last token is target
+            with_grad: whether to compute gradients and call backward
 
         Returns:
-            loss: scalar loss value
+            (loss, logits): loss scalar and logits tensor
         """
-        # Create input and targets
-        x = idx[:, :-1]
-        y = idx[:, 1:]
+        # Forward pass on inputs[:-1], predict inputs[-1]
+        logits, _ = self.forward(inputs[:, :-1])
+        logits = logits.transpose(1, 2)
 
-        # Forward pass
+        # Compute loss only on last position (like other models)
+        loss = F.cross_entropy(
+            logits[:, :, -1], inputs[:, -1], reduction='mean')
+
         if with_grad:
-            logits, loss = self.forward(x, y)
-        else:
-            with torch.no_grad():
-                logits, loss = self.forward(x, y)
+            loss.backward()
 
-        return loss
+        return loss, logits
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
