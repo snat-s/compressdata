@@ -23,7 +23,9 @@ from muon_optimizer import configure_optimizers
 # from mamba_ssm.models.config_mamba import MambaConfig
 from tqdm import trange
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available()
+                      else "mps" if torch.backends.mps.is_available()
+                      else "cpu")
 print(device)
 BATCH_SIZE = 1024 
 SEQ_LENGTH = 8
@@ -37,7 +39,7 @@ SEED = 42
 MODEL_TYPE = "modern_gpt"  # Options: "gpt", "rwkv_v7", "slim_performer", "modern_gpt"
 VOCAB_DIM = 256
 HIDDEN_DIM = 256
-N_LAYERS = 1
+N_LAYERS = 2
 #FFN_DIM = 256           # Only used by slim_performer
 N_HEADS = 8             # Head size = 256/8 = 32
 FEATURE_TYPE = 'sqr'
@@ -79,13 +81,19 @@ def build_model(model_type, seq_length):
         raise ValueError(f"Unknown model type: {model_type}")
 
 TMP_DIR = "tmp"
-FILE_PATH = "src/data/alice.txt"
-COMPRESSED_FILE = f"alice_{N_LAYERS}L_{VOCAB_DIM}d_{N_HEADS}h_b{BATCH_SIZE}"
+FILE_PATH = "src/data/enwik8"
+COMPRESSED_FILE = f"enwik8_{N_LAYERS}L_{VOCAB_DIM}d_{N_HEADS}h_b{BATCH_SIZE}"
 
 # Initialize wandb if available
 if USE_WANDB:
+    # Build descriptive run name: model_layers_dim_heads_optimizer_dataset
+    dataset_name = os.path.basename(FILE_PATH).replace('.txt', '').replace('.xml', '')
+    optimizer_tag = "muon" if USE_MUON else "adam"
+    run_name = f"{MODEL_TYPE}_{N_LAYERS}L_{VOCAB_DIM}d_{N_HEADS}h_{optimizer_tag}_{dataset_name}"
+
     wandb.init(
         project="compressdata",
+        name=run_name,
         config={
             "learning_rate": LEARNING_RATE,
             "architecture": MODEL_TYPE,
