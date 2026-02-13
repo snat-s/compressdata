@@ -370,8 +370,8 @@ class ModernGPT(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Sequence length {t} exceeds block size {self.config.block_size}"
 
-        # Token embeddings
-        tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
+        # Token embeddings with sqrt(d_model) scaling (NNCP-style)
+        tok_emb = self.transformer.wte(idx) * math.sqrt(self.config.n_embd)  # (B, T, n_embd)
         x = self.transformer.drop(tok_emb)
 
         # Transformer blocks
@@ -403,20 +403,23 @@ class ModernGPT(nn.Module):
             with_grad: whether to compute gradients and call backward
 
         Returns:
-            (loss, logits): loss scalar and logits tensor
+            (loss, logits): loss scalar and logits tensor (B, vocab, T)
         """
-        # Forward pass on inputs[:-1], predict inputs[-1]
-        logits, _ = self.forward(inputs[:, :-1])
-        logits = logits.transpose(1, 2)
+        # Forward pass on inputs[:-1], predict inputs[1:]
+        logits, _ = self.forward(inputs[:, :-1])  # (B, T, vocab)
 
-        # Compute loss only on last position (like other models)
+        # Full-sequence loss: compute cross-entropy over ALL positions
+        # This gives T times more gradient signal vs last-position-only
+        targets = inputs[:, 1:]  # (B, T)
         loss = F.cross_entropy(
-            logits[:, :, -1], inputs[:, -1], reduction='mean')
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            reduction='mean')
 
         if with_grad:
             loss.backward()
 
-        return loss, logits
+        return loss, logits.transpose(1, 2)
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):

@@ -231,7 +231,7 @@ class MuonAdamW:
         muon_lr=0.02,
         adamw_lr=3e-4,
         momentum=0.95,
-        betas=(0.9, 0.95),
+        betas=(0.0, 0.9999),  # beta1=0 for online/non-stationary learning (NNCP-style)
         eps=1e-8,
         weight_decay=0.0,
     ):
@@ -276,8 +276,16 @@ class MuonAdamW:
         self.muon.load_state_dict(state_dict['muon'])
         self.adamw.load_state_dict(state_dict['adamw'])
 
+    def set_lr(self, adamw_lr, muon_lr):
+        """Update learning rates for both sub-optimizers."""
+        for pg in self.adamw.param_groups:
+            pg['lr'] = adamw_lr
+        for pg in self.muon.param_groups:
+            pg['lr'] = muon_lr
 
-def configure_optimizers(model, muon_lr=0.02, adamw_lr=3e-4, weight_decay=0.0, device_type='cuda'):
+
+def configure_optimizers(model, muon_lr=0.02, adamw_lr=3e-4, weight_decay=0.0,
+                         momentum=0.95, device_type='cuda'):
     """
     Configure optimizers for a model using Muon for weights and AdamW for others.
 
@@ -290,6 +298,7 @@ def configure_optimizers(model, muon_lr=0.02, adamw_lr=3e-4, weight_decay=0.0, d
         muon_lr: learning rate for Muon
         adamw_lr: learning rate for AdamW
         weight_decay: weight decay coefficient
+        momentum: momentum for Muon optimizer
         device_type: 'cuda' or 'cpu'
 
     Returns:
@@ -315,8 +324,8 @@ def configure_optimizers(model, muon_lr=0.02, adamw_lr=3e-4, weight_decay=0.0, d
         adamw_params=adamw_params,
         muon_lr=muon_lr,
         adamw_lr=adamw_lr,
-        momentum=0.95,
-        betas=(0.9, 0.95),
+        momentum=momentum,
+        betas=(0.0, 0.9999),  # beta1=0 for online/non-stationary learning (NNCP-style)
         eps=1e-8,
         weight_decay=weight_decay,
     )
