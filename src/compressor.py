@@ -2,6 +2,7 @@
    The structure is mainly based from the works of Yu Mao, et. al.
    https://github.com/mynotwo/A-Fast-Transformer-based-General-Purpose-LosslessCompressor
 """
+import argparse
 import numpy as np
 import os
 import torch
@@ -27,28 +28,78 @@ device = torch.device("cuda" if torch.cuda.is_available()
                       else "mps" if torch.backends.mps.is_available()
                       else "cpu")
 print(device)
-BATCH_SIZE = 1024 
+
+# Defaults (overridable via CLI args)
+BATCH_SIZE = 256
 SEQ_LENGTH = 8
-ENCODE = True 
-DECODE = False 
+ENCODE = True
+DECODE = False
 VOCAB_SIZE = 256
 LOG_TRAINING = 10000
 SEED = 42
-
-# MODEL CONFIG - Optimized for 8-hour enwik8 run
-MODEL_TYPE = "modern_gpt"  # Options: "gpt", "rwkv_v7", "slim_performer", "modern_gpt"
+MODEL_TYPE = "modern_gpt"
 VOCAB_DIM = 256
 HIDDEN_DIM = 256
 N_LAYERS = 2
-#FFN_DIM = 256           # Only used by slim_performer
-N_HEADS = 8             # Head size = 256/8 = 32
+N_HEADS = 8
 FEATURE_TYPE = 'sqr'
 COMPUTE_TYPE = 'iter'
-LEARNING_RATE = 3e-4    # Stable for long runs (used for AdamW params in modern_gpt)
+LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 0.0
-USE_MUON = True         # Use Muon optimizer for modern_gpt (better than Adam)
-MUON_LR = 0.02          # Learning rate for Muon optimizer
-# END MODEL CONFIG
+USE_MUON = True
+MUON_LR = 0.02
+MUON_MOMENTUM = 0.95
+GRAD_CLIP = 1.0
+LR_WARMUP_STEPS = 1000
+LR_DECAY_START = 10000
+LR_DECAY_POWER = 0.5
+WANDB_RUN_NAME = None
+WANDB_GROUP = None
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Neural network lossless compression")
+    # Data
+    p.add_argument('--file_path', type=str, default='src/data/alice.txt')
+    p.add_argument('--encode_only', action='store_true', help='Only encode (no decode)')
+    p.add_argument('--decode_only', action='store_true', help='Only decode (no encode)')
+    # Model architecture
+    p.add_argument('--model_type', type=str, default='modern_gpt',
+                   choices=['gpt', 'rwkv_v7', 'slim_performer', 'modern_gpt'])
+    p.add_argument('--n_embd', type=int, default=256)
+    p.add_argument('--n_layers', type=int, default=2)
+    p.add_argument('--n_heads', type=int, default=8)
+    # Training
+    p.add_argument('--batch_size', type=int, default=256)
+    p.add_argument('--seq_length', type=int, default=8)
+    p.add_argument('--lr', type=float, default=3e-4, help='AdamW learning rate')
+    p.add_argument('--muon_lr', type=float, default=0.02, help='Muon learning rate')
+    p.add_argument('--weight_decay', type=float, default=0.0)
+    p.add_argument('--grad_clip', type=float, default=1.0, help='Max gradient norm (0=disable)')
+    p.add_argument('--muon_momentum', type=float, default=0.95)
+    p.add_argument('--no_muon', action='store_true', help='Disable Muon, use Adam only')
+    # LR schedule
+    p.add_argument('--warmup_steps', type=int, default=1000)
+    p.add_argument('--decay_start', type=int, default=10000)
+    p.add_argument('--decay_power', type=float, default=0.5)
+    # Misc
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--log_interval', type=int, default=10000)
+    # Wandb
+    p.add_argument('--wandb_run_name', type=str, default=None, help='Override wandb run name')
+    p.add_argument('--wandb_group', type=str, default=None, help='Wandb group for sweep phases')
+    return p.parse_args()
+
+
+def get_lr(step, base_lr, warmup_steps=LR_WARMUP_STEPS,
+           decay_start=LR_DECAY_START, decay_power=LR_DECAY_POWER):
+    """NNCP-style LR schedule: linear warmup -> constant -> power-law decay."""
+    if step < warmup_steps:
+        return base_lr * (step + 1) / warmup_steps
+    elif step < decay_start:
+        return base_lr
+    else:
+        return base_lr * (decay_start / step) ** decay_power
 
 
 def build_model(model_type, seq_length):
@@ -81,28 +132,41 @@ def build_model(model_type, seq_length):
         raise ValueError(f"Unknown model type: {model_type}")
 
 TMP_DIR = "tmp"
-FILE_PATH = "src/data/enwik8"
-COMPRESSED_FILE = f"enwik8_{N_LAYERS}L_{VOCAB_DIM}d_{N_HEADS}h_b{BATCH_SIZE}"
+FILE_PATH = "src/data/alice.txt"
+COMPRESSED_FILE = None  # Set in main() from args
 
-# Initialize wandb if available
-if USE_WANDB:
-    # Build descriptive run name: model_layers_dim_heads_optimizer_dataset
+
+def init_wandb():
+    """Initialize wandb if available, using current global config."""
+    if not USE_WANDB:
+        return
     dataset_name = os.path.basename(FILE_PATH).replace('.txt', '').replace('.xml', '')
     optimizer_tag = "muon" if USE_MUON else "adam"
-    run_name = f"{MODEL_TYPE}_{N_LAYERS}L_{VOCAB_DIM}d_{N_HEADS}h_{optimizer_tag}_{dataset_name}"
-
-    wandb.init(
+    run_name = WANDB_RUN_NAME or f"{MODEL_TYPE}_{N_LAYERS}L_{VOCAB_DIM}d_{N_HEADS}h_{optimizer_tag}_{dataset_name}"
+    init_kwargs = dict(
         project="compressdata",
         name=run_name,
+    )
+    if WANDB_GROUP:
+        init_kwargs['group'] = WANDB_GROUP
+    wandb.init(
+        **init_kwargs,
         config={
             "learning_rate": LEARNING_RATE,
+            "muon_lr": MUON_LR,
             "architecture": MODEL_TYPE,
             "dataset": FILE_PATH,
             "n_layers": N_LAYERS,
-            "hidden_dim": HIDDEN_DIM,
+            "n_embd": VOCAB_DIM,
             "n_heads": N_HEADS,
             "batch_size": BATCH_SIZE,
             "seq_length": SEQ_LENGTH,
+            "grad_clip": GRAD_CLIP,
+            "muon_momentum": MUON_MOMENTUM,
+            "warmup_steps": LR_WARMUP_STEPS,
+            "decay_start": LR_DECAY_START,
+            "decay_power": LR_DECAY_POWER,
+            "weight_decay": WEIGHT_DECAY,
         }
     )
 
@@ -180,9 +244,10 @@ def decode(temp_dir, compressed_file, len_series, last):
     if MODEL_TYPE == "modern_gpt" and USE_MUON:
         optimizer = configure_optimizers(
             model, muon_lr=MUON_LR, adamw_lr=LEARNING_RATE,
-            weight_decay=WEIGHT_DECAY, device_type='cuda' if torch.cuda.is_available() else 'cpu'
+            weight_decay=WEIGHT_DECAY, momentum=MUON_MOMENTUM,
+            device_type='cuda' if torch.cuda.is_available() else 'cpu'
         )
-        print(f"Using Muon optimizer (muon_lr={MUON_LR}, adamw_lr={LEARNING_RATE})")
+        print(f"Using Muon optimizer (muon_lr={MUON_LR}, adamw_lr={LEARNING_RATE}, momentum={MUON_MOMENTUM})")
     else:
         optimizer = torch.optim.Adam(model.parameters(
         ), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=(.9, .999))
@@ -211,16 +276,19 @@ def decode(temp_dir, compressed_file, len_series, last):
                       SEQ_LENGTH] = dec[i].read(cumul_batch[i, :], VOCAB_SIZE)
 
         # Now train on this batch (compute loss and update weights)
-        logits = logits.transpose(1, 2)
+        # Full-sequence loss: use all positions, not just the last
         label = torch.from_numpy(
-            series_2d[:, train_index+1:train_index+SEQ_LENGTH+1])#.cuda()
-        label = label.to(device)
+            series_2d[:, train_index+1:train_index+SEQ_LENGTH+1]).to(device)
         train_loss = torch.nn.functional.cross_entropy(
-            logits[:, :, -1], label[:, -1], reduction='mean')
+            logits.reshape(-1, logits.size(-1)),
+            label.reshape(-1),
+            reduction='mean')
 
         if USE_WANDB:
             wandb.log({"loss": train_loss.item()})
         train_loss.backward()
+        if GRAD_CLIP > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -303,9 +371,10 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
     if MODEL_TYPE == "modern_gpt" and USE_MUON:
         optim = configure_optimizers(
             model, muon_lr=MUON_LR, adamw_lr=LEARNING_RATE,
-            weight_decay=WEIGHT_DECAY, device_type='cuda' if torch.cuda.is_available() else 'cpu'
+            weight_decay=WEIGHT_DECAY, momentum=MUON_MOMENTUM,
+            device_type='cuda' if torch.cuda.is_available() else 'cpu'
         )
-        print(f"Using Muon optimizer (muon_lr={MUON_LR}, adamw_lr={LEARNING_RATE})")
+        print(f"Using Muon optimizer (muon_lr={MUON_LR}, adamw_lr={LEARNING_RATE}, momentum={MUON_MOMENTUM})")
     else:
         optim = torch.optim.Adam(
             model.parameters(), LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -319,6 +388,8 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
         train_loss, logits = model.full_loss(train_batch, with_grad=True)
         if USE_WANDB:
             wandb.log({"loss": train_loss.item()})
+        if GRAD_CLIP > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
         optim.step()
         optim.zero_grad(set_to_none=True)
 
@@ -331,14 +402,30 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
             enc[i].write(cumul_batch[i, :], y[i])
 
         ind += 1
+        # Log compressed size every 50 steps for real-time tracking
+        if train_index % 50 == 0:
+            # Flush all file buffers so os.path.getsize reflects actual data
+            for fi in f:
+                fi.flush()
+            size = 0
+            for cf in os.listdir(temp_dir):
+                size += os.path.getsize(temp_dir+"/"+cf)
+            bytes_processed = (train_index + 1 + SEQ_LENGTH) * BATCH_SIZE
+            running_bpb = (size * 8) / bytes_processed if bytes_processed > 0 else 0
+            projected_ratio = bytes_processed / size if size > 0 else 0
+            if USE_WANDB:
+                wandb.log({
+                    "size_bytes": size,
+                    "size_mb": size / (1024 * 1024),
+                    "running_bpb": running_bpb,
+                    "projected_ratio": projected_ratio,
+                })
         if train_index % LOG_TRAINING == 0:
             size = 0
             for cf in os.listdir(temp_dir):
                 size += os.path.getsize(temp_dir+"/"+cf)
             print(train_index, ":", train_loss.item() /
                   np.log(2), "size:", size/(1024*1024))
-            if USE_WANDB:
-                wandb.log({"size_bytes": size})
 
     for i in range(BATCH_SIZE):
         enc[i].finish()
@@ -367,6 +454,55 @@ def encode(temp_dir, compressed_file, series, train_data, last_train_data):
 
 
 def main():
+    global BATCH_SIZE, SEQ_LENGTH, ENCODE, DECODE, SEED, LOG_TRAINING
+    global MODEL_TYPE, VOCAB_DIM, HIDDEN_DIM, N_LAYERS, N_HEADS
+    global LEARNING_RATE, WEIGHT_DECAY, USE_MUON, MUON_LR, MUON_MOMENTUM
+    global GRAD_CLIP, LR_WARMUP_STEPS, LR_DECAY_START, LR_DECAY_POWER
+    global FILE_PATH, COMPRESSED_FILE, WANDB_RUN_NAME, WANDB_GROUP
+
+    args = parse_args()
+
+    # Override globals from CLI args
+    BATCH_SIZE = args.batch_size
+    SEQ_LENGTH = args.seq_length
+    SEED = args.seed
+    LOG_TRAINING = args.log_interval
+    MODEL_TYPE = args.model_type
+    VOCAB_DIM = args.n_embd
+    HIDDEN_DIM = args.n_embd
+    N_LAYERS = args.n_layers
+    N_HEADS = args.n_heads
+    LEARNING_RATE = args.lr
+    WEIGHT_DECAY = args.weight_decay
+    USE_MUON = not args.no_muon
+    MUON_LR = args.muon_lr
+    MUON_MOMENTUM = args.muon_momentum
+    GRAD_CLIP = args.grad_clip
+    LR_WARMUP_STEPS = args.warmup_steps
+    LR_DECAY_START = args.decay_start
+    LR_DECAY_POWER = args.decay_power
+    FILE_PATH = args.file_path
+    WANDB_RUN_NAME = args.wandb_run_name
+    WANDB_GROUP = args.wandb_group
+
+    if args.encode_only:
+        ENCODE, DECODE = True, False
+    elif args.decode_only:
+        ENCODE, DECODE = False, True
+    else:
+        ENCODE, DECODE = True, False  # default: encode only
+
+    # Derived config
+    dataset_name = os.path.basename(FILE_PATH).split('.')[0]
+    COMPRESSED_FILE = f"{dataset_name}_{N_LAYERS}L_{VOCAB_DIM}d_{N_HEADS}h_b{BATCH_SIZE}"
+    SEQ_LENGTH = SEQ_LENGTH * (HIDDEN_DIM // VOCAB_DIM)
+
+    print(f"Config: {MODEL_TYPE} {N_LAYERS}L {VOCAB_DIM}d {N_HEADS}h | "
+          f"batch={BATCH_SIZE} seq={SEQ_LENGTH} | "
+          f"lr={LEARNING_RATE} muon_lr={MUON_LR} clip={GRAD_CLIP}")
+
+    init_wandb()
+
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     temp_dir = TMP_DIR
@@ -381,11 +517,6 @@ def main():
         nrows = ((a.size - L) // S) + 1
         n = a.strides[0]
         return np.lib.stride_tricks.as_strided(a, shape=(nrows, L), strides=(S * n, n))
-
-    global SEQ_LENGTH
-    # print(SEQ_LENGTH)
-    SEQ_LENGTH = SEQ_LENGTH*(HIDDEN_DIM // VOCAB_DIM)
-    # print(SEQ_LENGTH)
 
     with open(file_path, "rb") as f:
         series = np.frombuffer(f.read(), dtype=np.uint8)
